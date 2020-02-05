@@ -17,3 +17,6 @@ lazy_static = "1"
 regex = "1"
 clap = "2"
 futures-retry = "0.3"
+log = "0.4"
+env_logger = "0.5"
+log-panics = { version = "1" , features = ["with-backtrace"] }

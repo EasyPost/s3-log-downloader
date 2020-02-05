@@ -16,6 +16,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use tokio;
 use tokio_sync::semaphore::Semaphore;
+use log::{debug, info, warn, error};
+use env_logger;
 
 mod sem;
 
@@ -67,7 +69,7 @@ impl OutputManager {
             let f = map.entry(date_key.clone()).or_insert_with(|| {
                 let mut filename = self.output_dir.clone();
                 filename.push(date_key);
-                println!("opening {:?} for writing", filename);
+                debug!("opening {:?} for writing", filename);
                 let f = File::create(filename).unwrap();
                 BufWriter::new(f)
             });
@@ -91,11 +93,11 @@ fn fetch_object(
     let fetch_future = client.get_object(req);
     let releaser = Arc::clone(&semaphore);
     sem::SemaphoreWaiter::new(semaphore)
-        .map_err(|e| eprintln!("error acquiring semaphore: {:?}", e))
+        .map_err(|e| error!("error acquiring semaphore: {:?}", e))
         .and_then(|mut permit| {
             fetch_future
                 .map_err(move |e| {
-                    eprintln!(
+                    error!(
                         "got error {:?} while fetching metadata for key {}",
                         e, error_key
                     )
@@ -103,7 +105,7 @@ fn fetch_object(
                 .and_then(|resp| {
                     tokio::io::read_to_end(resp.body.unwrap().into_async_read(), Vec::new())
                         .map(|(_, body)| body)
-                        .map_err(|e| eprintln!("error reading body: {:?}", e))
+                        .map_err(|e| error!("error reading body: {:?}", e))
                         .then(move |res| {
                             permit.release(&releaser);
                             res
@@ -137,7 +139,7 @@ fn fetch_key_chunk(
                 .unwrap_or_else(Vec::new);
             (contents, next_ct)
         })
-        .map_err(|e| eprintln!("error listing: {:?}", e))
+        .map_err(|e| error!("error listing: {:?}", e))
 }
 
 struct CappedRetry {
@@ -155,8 +157,11 @@ impl<InError> futures_retry::ErrorHandler<InError> for CappedRetry {
 
     fn handle(&mut self, e: InError) -> futures_retry::RetryPolicy<Self::OutError> {
         if self.retries_remaining == 0 {
+            warn!("retries exhausted!");
             futures_retry::RetryPolicy::ForwardError(e)
         } else {
+            debug!("retrying");
+            self.retries_remaining -= 1;
             futures_retry::RetryPolicy::WaitRetry(Duration::from_millis(50))
         }
     }
@@ -209,7 +214,7 @@ fn async_main(
         count
     })
     .collect()
-    .map(|counts| println!("fetched {} keys", counts.iter().sum::<u64>()))
+    .map(|counts| info!("fetched {} keys", counts.iter().sum::<u64>()))
 }
 
 fn main() {
@@ -259,6 +264,10 @@ fn main() {
         .unwrap()
         .parse()
         .expect("--concurrent-fetches must be a usize");
+
+    env_logger::init();
+    log_panics::init();
+
     tokio::run(async_main(
         bucket,
         prefix,
