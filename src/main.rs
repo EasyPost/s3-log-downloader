@@ -14,6 +14,9 @@ use tokio;
 use lazy_static::lazy_static;
 use regex::Regex;
 use clap::Arg;
+use tokio_sync::semaphore::Semaphore;
+
+mod sem;
 
 enum ContinuationToken {
     Initial,
@@ -73,22 +76,33 @@ impl OutputManager {
     }
 }
 
-fn fetch_object(client: &rusoto_s3::S3Client, bucket: String, output_manager: Arc<OutputManager>, key: String) -> impl Future<Item = (), Error = ()> {
+fn fetch_object(client: &rusoto_s3::S3Client, semaphore: Arc<Semaphore>, bucket: String, output_manager: Arc<OutputManager>, key: String) -> impl Future<Item = (), Error = ()> {
     let mut req = rusoto_s3::GetObjectRequest::default();
     req.key = key.clone();
     req.bucket = bucket;
     let error_key = key.clone();
-    client
-        .get_object(req)
-        .map_err(move |e| 
-            eprintln!("got error {:?} while fetching metadata for key {}", e, error_key)
-        )
-        .and_then(|resp| {
-            tokio::io::read_to_end(resp.body.unwrap().into_async_read(), Vec::new()).map(|(_, body)| body).map_err(|e| eprintln!("error reading body: {:?}", e))
-        })
-        .map(move |body| {
-            output_manager.write_response_for_key(key, body);
-        })
+    let fetch_future = client.get_object(req);
+    let releaser = Arc::clone(&semaphore);
+    sem::SemaphoreWaiter::new(semaphore)
+        .map_err(|e| eprintln!("error acquiring semaphore: {:?}", e))
+        .and_then(|mut permit| fetch_future
+            .map_err(move |e|
+                eprintln!("got error {:?} while fetching metadata for key {}", e, error_key)
+            )
+            .and_then(|resp| {
+                tokio::io::read_to_end(
+                    resp.body.unwrap().into_async_read(), Vec::new()
+                )
+                    .map(|(_, body)| body)
+                    .map_err(|e| eprintln!("error reading body: {:?}", e))
+                    .then(move |res| {
+                        permit.release(&releaser);
+                        res
+                    })
+            })
+            .map(move |body| {
+                output_manager.write_response_for_key(key, body);
+            }))
 }
 
 fn fetch_key_chunk(
@@ -115,11 +129,13 @@ fn fetch_key_chunk(
         .map_err(|e| eprintln!("error listing: {:?}", e))
 }
 
-fn async_main(bucket: String, prefix: String, output_dir: String) -> impl Future<Item = (), Error = ()> {
+fn async_main(bucket: String, prefix: String, output_dir: String, max_concurrent_fetches: usize) -> impl Future<Item = (), Error = ()> {
     let client = Arc::new(rusoto_s3::S3Client::new(Region::UsWest2));
     let key_client = Arc::clone(&client);
     let bucket_client = bucket.clone();
     let output_manager = Arc::new(OutputManager::new(output_dir));
+
+    let fetch_sem = Arc::new(Semaphore::new(max_concurrent_fetches));
 
     let keys = futures::stream::unfold(ContinuationToken::Initial, move |continuation_token| {
         if let ContinuationToken::Finished = continuation_token {
@@ -136,7 +152,7 @@ fn async_main(bucket: String, prefix: String, output_dir: String) -> impl Future
     keys.map(move |chunk| {
         let mut count = 0;
         for key in chunk {
-            tokio::spawn(fetch_object(&key_client, bucket_client.clone(), Arc::clone(&output_manager), key));
+            tokio::spawn(fetch_object(&key_client, Arc::clone(&fetch_sem), bucket_client.clone(), Arc::clone(&output_manager), key));
             count += 1;
         }
         count
@@ -168,10 +184,17 @@ fn main() {
                                      .takes_value(true)
                                      .required(true)
                                      .help("Output directory"))
+                            .arg(Arg::with_name("concurrent_fetches")
+                                     .short("C")
+                                     .long("concurrent-fetches")
+                                     .takes_value(true)
+                                     .default_value("500")
+                                     .help("Maximum concurrent fetches"))
                             .get_matches();
 
     let bucket = matches.value_of("bucket").unwrap().to_owned();
     let prefix = matches.value_of("prefix").unwrap().to_owned();
     let output_dir = matches.value_of("output_dir").unwrap().to_owned();
-    tokio::run(async_main(bucket, prefix, output_dir));
+    let max_concurrent_fetches = matches.value_of("concurrent_fetches").unwrap().parse().expect("--concurrent-fetches must be a usize");
+    tokio::run(async_main(bucket, prefix, output_dir, max_concurrent_fetches));
 }
