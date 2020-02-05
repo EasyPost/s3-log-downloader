@@ -4,6 +4,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rusoto_core::Region;
 use rusoto_s3::S3;
@@ -76,15 +77,16 @@ impl OutputManager {
 }
 
 fn fetch_object(
-    client: &rusoto_s3::S3Client,
+    client: Arc<rusoto_s3::S3Client>,
     semaphore: Arc<Semaphore>,
-    bucket: String,
+    bucket: Arc<String>,
     output_manager: Arc<OutputManager>,
-    key: String,
+    key: &str,
 ) -> impl Future<Item = (), Error = ()> {
+    let key = key.to_owned();
     let mut req = rusoto_s3::GetObjectRequest::default();
     req.key = key.clone();
-    req.bucket = bucket;
+    req.bucket = bucket.to_string();
     let error_key = key.clone();
     let fetch_future = client.get_object(req);
     let releaser = Arc::clone(&semaphore);
@@ -113,6 +115,7 @@ fn fetch_object(
         })
 }
 
+
 fn fetch_key_chunk(
     client: &rusoto_s3::S3Client,
     bucket: String,
@@ -137,6 +140,28 @@ fn fetch_key_chunk(
         .map_err(|e| eprintln!("error listing: {:?}", e))
 }
 
+struct CappedRetry {
+    retries_remaining: usize
+}
+
+impl CappedRetry {
+    fn new(retries: usize) -> Self {
+        CappedRetry { retries_remaining: retries }
+    }
+}
+
+impl<InError> futures_retry::ErrorHandler<InError> for CappedRetry {
+    type OutError = InError;
+
+    fn handle(&mut self, e: InError) -> futures_retry::RetryPolicy<Self::OutError> {
+        if self.retries_remaining == 0 {
+            futures_retry::RetryPolicy::ForwardError(e)
+        } else {
+            futures_retry::RetryPolicy::WaitRetry(Duration::from_millis(50))
+        }
+    }
+}
+
 fn async_main(
     bucket: String,
     prefix: String,
@@ -145,7 +170,7 @@ fn async_main(
 ) -> impl Future<Item = (), Error = ()> {
     let client = Arc::new(rusoto_s3::S3Client::new(Region::UsWest2));
     let key_client = Arc::clone(&client);
-    let bucket_client = bucket.clone();
+    let bucket_client = Arc::new(bucket.clone());
     let output_manager = Arc::new(OutputManager::new(output_dir));
 
     let fetch_sem = Arc::new(Semaphore::new(max_concurrent_fetches));
@@ -167,13 +192,17 @@ fn async_main(
     });
     keys.map(move |chunk| {
         let mut count = 0;
-        for key in chunk {
-            tokio::spawn(fetch_object(
-                &key_client,
-                Arc::clone(&fetch_sem),
-                bucket_client.clone(),
-                Arc::clone(&output_manager),
-                key,
+        for key in chunk.into_iter() {
+            let our_key_client = Arc::clone(&key_client);
+            let our_fetch_sem = Arc::clone(&fetch_sem);
+            let our_output_manager = Arc::clone(&output_manager);
+            let our_bucket_client = Arc::clone(&bucket_client);
+            tokio::spawn(futures_retry::FutureRetry::new(
+                move || {
+                    let key = key.clone();
+                    fetch_object( Arc::clone(&our_key_client), Arc::clone(&our_fetch_sem), Arc::clone(&our_bucket_client), Arc::clone(&our_output_manager), &key)
+                },
+                CappedRetry::new(3)
             ));
             count += 1;
         }
