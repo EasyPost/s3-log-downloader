@@ -106,10 +106,10 @@ fn fetch_object(
                     tokio::io::read_to_end(resp.body.unwrap().into_async_read(), Vec::new())
                         .map(|(_, body)| body)
                         .map_err(|e| error!("error reading body: {:?}", e))
-                        .then(move |res| {
-                            permit.release(&releaser);
-                            res
-                        })
+                })
+                .then(move |res| {
+                    permit.release(&releaser);
+                    res
                 })
                 .map(move |body| {
                     output_manager.write_response_for_key(key, body);
