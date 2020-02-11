@@ -10,14 +10,14 @@ use rusoto_core::Region;
 use rusoto_s3::S3;
 
 use clap::Arg;
+use env_logger;
 use futures::stream::Stream;
 use futures::Future;
 use lazy_static::lazy_static;
+use log::{debug, error, info, warn};
 use regex::Regex;
 use tokio;
 use tokio_sync::semaphore::Semaphore;
-use log::{debug, info, warn, error};
-use env_logger;
 
 mod sem;
 
@@ -117,7 +117,6 @@ fn fetch_object(
         })
 }
 
-
 fn fetch_key_chunk(
     client: &rusoto_s3::S3Client,
     bucket: String,
@@ -143,12 +142,14 @@ fn fetch_key_chunk(
 }
 
 struct CappedRetry {
-    retries_remaining: usize
+    retries_remaining: usize,
 }
 
 impl CappedRetry {
     fn new(retries: usize) -> Self {
-        CappedRetry { retries_remaining: retries }
+        CappedRetry {
+            retries_remaining: retries,
+        }
     }
 }
 
@@ -205,9 +206,15 @@ fn async_main(
             tokio::spawn(futures_retry::FutureRetry::new(
                 move || {
                     let key = key.clone();
-                    fetch_object( Arc::clone(&our_key_client), Arc::clone(&our_fetch_sem), Arc::clone(&our_bucket_client), Arc::clone(&our_output_manager), &key)
+                    fetch_object(
+                        Arc::clone(&our_key_client),
+                        Arc::clone(&our_fetch_sem),
+                        Arc::clone(&our_bucket_client),
+                        Arc::clone(&our_output_manager),
+                        &key,
+                    )
                 },
-                CappedRetry::new(3)
+                CappedRetry::new(3),
             ));
             count += 1;
         }
