@@ -82,9 +82,11 @@ async fn retry_fetch(
     debug!("starting fetch for {:?} {:?}", bucket, key);
     let mut last_err = None;
     for _ in 0..attempts {
-        let mut req = rusoto_s3::GetObjectRequest::default();
-        req.key = key.clone();
-        req.bucket = bucket.clone();
+        let req = rusoto_s3::GetObjectRequest {
+            key: key.clone(),
+            bucket: bucket.clone(),
+            ..Default::default()
+        };
         match client.get_object(req).await {
             Ok(val) => {
                 debug!("fetch successful");
@@ -98,7 +100,7 @@ async fn retry_fetch(
         }
     }
     error!("ran out of retries on {:?}: {:?}", key, last_err);
-    return Err(last_err.unwrap());
+    Err(last_err.unwrap())
 }
 
 async fn fetch_object(
@@ -125,11 +127,13 @@ async fn fetch_key_chunk(
     prefix: String,
     continuation_token: Option<String>,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
-    let mut req = rusoto_s3::ListObjectsV2Request::default();
-    req.bucket = bucket;
-    req.delimiter = Some("/".to_owned());
-    req.prefix = Some(prefix);
-    req.continuation_token = continuation_token;
+    let req = rusoto_s3::ListObjectsV2Request {
+        bucket,
+        delimiter: Some("/".to_owned()),
+        prefix: Some(prefix),
+        continuation_token,
+        ..Default::default()
+    };
     let resp = client.list_objects_v2(req).await?;
     let next_ct = resp.next_continuation_token;
     let contents = resp
