@@ -9,14 +9,12 @@ use rusoto_core::Region;
 use rusoto_s3::S3;
 
 use clap::Arg;
-use futures::stream::Stream;
-use futures::Future;
+use futures::stream::StreamExt;
 use lazy_static::lazy_static;
+use log::{debug, error, warn};
 use regex::Regex;
-use tokio;
-use tokio_sync::semaphore::Semaphore;
-
-mod sem;
+use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 
 enum ContinuationToken {
     Initial,
@@ -75,112 +73,136 @@ impl OutputManager {
     }
 }
 
-fn fetch_object(
+async fn retry_fetch(
     client: &rusoto_s3::S3Client,
+    bucket: String,
+    key: String,
+    attempts: usize,
+) -> Result<rusoto_s3::GetObjectOutput, rusoto_core::RusotoError<rusoto_s3::GetObjectError>> {
+    debug!("starting fetch for {:?} {:?}", bucket, key);
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let mut req = rusoto_s3::GetObjectRequest::default();
+        req.key = key.clone();
+        req.bucket = bucket.clone();
+        match client.get_object(req).await {
+            Ok(val) => {
+                debug!("fetch successful");
+                return Ok(val);
+            }
+            Err(e) => {
+                warn!("got error {:?}, retrying in a few seconds", e);
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+    error!("ran out of retries on {:?}: {:?}", key, last_err);
+    return Err(last_err.unwrap());
+}
+
+async fn fetch_object(
+    client: Arc<rusoto_s3::S3Client>,
     semaphore: Arc<Semaphore>,
     bucket: String,
     output_manager: Arc<OutputManager>,
     key: String,
-) -> impl Future<Item = (), Error = ()> {
-    let mut req = rusoto_s3::GetObjectRequest::default();
-    req.key = key.clone();
-    req.bucket = bucket;
-    let error_key = key.clone();
-    let fetch_future = client.get_object(req);
-    let releaser = Arc::clone(&semaphore);
-    sem::SemaphoreWaiter::new(semaphore)
-        .map_err(|e| eprintln!("error acquiring semaphore: {:?}", e))
-        .and_then(|mut permit| {
-            fetch_future
-                .map_err(move |e| {
-                    eprintln!(
-                        "got error {:?} while fetching metadata for key {}",
-                        e, error_key
-                    )
-                })
-                .and_then(|resp| {
-                    tokio::io::read_to_end(resp.body.unwrap().into_async_read(), Vec::new())
-                        .map(|(_, body)| body)
-                        .map_err(|e| eprintln!("error reading body: {:?}", e))
-                        .then(move |res| {
-                            permit.release(&releaser);
-                            res
-                        })
-                })
-                .map(move |body| {
-                    output_manager.write_response_for_key(key, body);
-                })
-        })
+) -> anyhow::Result<()> {
+    let permit = semaphore.acquire().await?;
+    let resp = retry_fetch(&client, bucket.clone(), key.clone(), 3).await?;
+    let mut body = Vec::new();
+    if let Some(rbody) = resp.body {
+        rbody.into_async_read().read_to_end(&mut body).await?;
+    }
+    drop(permit);
+    output_manager.write_response_for_key(key, body);
+    Ok(())
 }
 
-fn fetch_key_chunk(
+async fn fetch_key_chunk(
     client: &rusoto_s3::S3Client,
     bucket: String,
     prefix: String,
     continuation_token: Option<String>,
-) -> impl Future<Item = (Vec<String>, Option<String>), Error = ()> {
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let mut req = rusoto_s3::ListObjectsV2Request::default();
     req.bucket = bucket;
     req.delimiter = Some("/".to_owned());
     req.prefix = Some(prefix);
     req.continuation_token = continuation_token;
-    client
-        .list_objects_v2(req)
-        .map(|resp| {
-            let next_ct = resp.next_continuation_token;
-            let contents = resp
-                .contents
-                .map(|c| c.into_iter().filter_map(|key| key.key).collect::<Vec<_>>())
-                .unwrap_or_else(Vec::new);
-            (contents, next_ct)
-        })
-        .map_err(|e| eprintln!("error listing: {:?}", e))
+    let resp = client.list_objects_v2(req).await?;
+    let next_ct = resp.next_continuation_token;
+    let contents = resp
+        .contents
+        .map(|c| c.into_iter().filter_map(|key| key.key).collect::<Vec<_>>())
+        .unwrap_or_else(Vec::new);
+    Ok((contents, next_ct))
 }
 
-fn async_main(
+#[tokio::main]
+async fn async_main(
     bucket: String,
     prefix: String,
     output_dir: String,
     max_concurrent_fetches: usize,
-) -> impl Future<Item = (), Error = ()> {
+) {
     let client = Arc::new(rusoto_s3::S3Client::new(Region::UsWest2));
-    let key_client = Arc::clone(&client);
-    let bucket_client = bucket.clone();
     let output_manager = Arc::new(OutputManager::new(output_dir));
+    let latter_client = Arc::clone(&client);
+    let latter_bucket = bucket.clone();
 
     let fetch_sem = Arc::new(Semaphore::new(max_concurrent_fetches));
 
-    let keys = futures::stream::unfold(ContinuationToken::Initial, move |continuation_token| {
-        if let ContinuationToken::Finished = continuation_token {
-            None
-        } else {
-            Some(
-                fetch_key_chunk(
-                    &client,
-                    bucket.clone(),
-                    prefix.clone(),
+    let count = futures::stream::unfold(ContinuationToken::Initial, |continuation_token| {
+        let list_client = Arc::clone(&client);
+        let list_bucket = bucket.clone();
+        let prefix = prefix.clone();
+        async move {
+            if let ContinuationToken::Finished = continuation_token {
+                None
+            } else {
+                let (c, ct) = match fetch_key_chunk(
+                    &list_client,
+                    list_bucket,
+                    prefix,
                     continuation_token.into_option(),
                 )
-                .map(|(c, ct)| (c, ContinuationToken::from_option(ct))),
-            )
+                .await
+                {
+                    Ok((c, ct)) => (c, ct),
+                    Err(e) => panic!("error fetching keys: {:?}", e),
+                };
+                Some((c, ContinuationToken::from_option(ct)))
+            }
         }
-    });
-    keys.map(move |chunk| {
-        let mut count = 0;
-        for key in chunk {
-            tokio::spawn(fetch_object(
-                &key_client,
-                Arc::clone(&fetch_sem),
-                bucket_client.clone(),
-                Arc::clone(&output_manager),
-                key,
-            ));
-            count += 1;
-        }
-        count
     })
-    .collect()
-    .map(|counts| println!("fetched {} keys", counts.iter().sum::<u64>()))
+    .then(move |chunk| {
+        let client = Arc::clone(&latter_client);
+        let fetch_sem = Arc::clone(&fetch_sem);
+        let latter_bucket = latter_bucket.clone();
+        let output_manager = Arc::clone(&output_manager);
+        async move {
+            log::info!("spawning for chunk of {:?} keys", chunk.len());
+            let mut handles = vec![];
+            for key in chunk {
+                let key_client = Arc::clone(&client);
+                handles.push(tokio::spawn(fetch_object(
+                    key_client,
+                    Arc::clone(&fetch_sem),
+                    latter_bucket.clone(),
+                    Arc::clone(&output_manager),
+                    key,
+                )));
+            }
+            let jobs = handles.len();
+            log::info!("spawned {:?} jobs", jobs);
+            futures::future::join_all(handles).await;
+            jobs
+        }
+    })
+    .fold(0usize, |acc, c| async move { acc.wrapping_add(c) })
+    .await;
+    println!("fetched {} keys", count);
 }
 
 fn main() {
@@ -189,38 +211,40 @@ fn main() {
         .author("James Brown <jbrown@easypost.com>")
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(
-            Arg::with_name("bucket")
-                .short("b")
+            Arg::new("bucket")
+                .short('b')
                 .long("bucket")
                 .takes_value(true)
                 .required(true)
                 .help("Bucket name to read from"),
         )
         .arg(
-            Arg::with_name("prefix")
-                .short("p")
+            Arg::new("prefix")
+                .short('p')
                 .long("prefix")
                 .takes_value(true)
                 .required(true)
                 .help("Prefix to read"),
         )
         .arg(
-            Arg::with_name("output_dir")
-                .short("o")
+            Arg::new("output_dir")
+                .short('o')
                 .long("output-dir")
                 .takes_value(true)
                 .required(true)
                 .help("Output directory"),
         )
         .arg(
-            Arg::with_name("concurrent_fetches")
-                .short("C")
+            Arg::new("concurrent_fetches")
+                .short('C')
                 .long("concurrent-fetches")
                 .takes_value(true)
                 .default_value("500")
                 .help("Maximum concurrent fetches"),
         )
         .get_matches();
+
+    env_logger::init();
 
     let bucket = matches.value_of("bucket").unwrap().to_owned();
     let prefix = matches.value_of("prefix").unwrap().to_owned();
@@ -230,10 +254,5 @@ fn main() {
         .unwrap()
         .parse()
         .expect("--concurrent-fetches must be a usize");
-    tokio::run(async_main(
-        bucket,
-        prefix,
-        output_dir,
-        max_concurrent_fetches,
-    ));
+    async_main(bucket, prefix, output_dir, max_concurrent_fetches);
 }

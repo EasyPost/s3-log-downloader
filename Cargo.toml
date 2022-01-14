@@ -8,11 +8,13 @@ license = "ISC"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rusoto_core = "0.42.0"
-rusoto_s3 = "0.42.0"
-futures = "0.1"
-tokio = "0.1"
-tokio-sync = "0.1"
+rusoto_core = "0.47.0"
+rusoto_s3 = "0.47.0"
+futures = "0.3"
+tokio = {version = "1", features=["full"]}
 lazy_static = "1"
 regex = "1"
-clap = "2"
+clap = "3"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.9"
